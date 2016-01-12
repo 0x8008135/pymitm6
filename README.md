@@ -32,6 +32,7 @@ pymitm6
 
          TARGET                         HACKER                          WORLD
 
+
 ####[Features]###################################################################
     
     now()
@@ -54,18 +55,11 @@ pymitm6
     - iptables
     
 
-####[Installation]###############################################################
-
-    No special installation needed... 
-    
-    Run as root and have fun !
-
-
 ####[Usage]######################################################################
 
     usage: pymitm6.py [-h] [-c DNS_FILE] [-int PHY_INT] [-dns4 DNS_V4]
                       [-dns6 DNS_V6] [-good GOOD_PREFIX] [-bad BAD_PREFIX]
-                      [-pool IP_POOL] -tun TUN_NAME [--mktun]
+                      [-pool IP_POOL] -tun TUN_NAME -u USER[--mktun]
 
     optional arguments:
       -h, --help         show this help message and exit
@@ -77,12 +71,19 @@ pymitm6
       -bad BAD_PREFIX    BAD prefix (CIDR)
       -pool IP_POOL      IPv4 pool for NAT64 (CIDR)
       -tun TUN_NAME      TUN Interface Name
+      -u USER            Running user
       --mktun            Create TUN interface
 
 
+    0 - Flush previous configuration
+
+    # ip link delete [TUN_NAME]
+    # iptables -F
+    # ip6tables -F
+
     1 - Create TUN interface :
 
-    # pymitm6.py -tun [TUN_NAME] --mktun
+    # pymitm6.py -u [USER] -tun [TUN_NAME] --mktun
 
     2 - Configure all interfaces :
 
@@ -102,6 +103,7 @@ pymitm6
     
     # iptables -t nat -A POSTROUTING -o [PHY_INT] -j MASQUERADE
     # ip6tables -A OUTPUT -p icmpv6 --icmpv6-type destination-unreachable -j DROP
+    # ip6tables -A OUTPUT -p icmpv6 --icmpv6-type router-solicitation -j DROP
 
     4 - Configure forwading :
 
@@ -116,4 +118,11 @@ pymitm6
                  -dns6 2001:6f8:608:fab::2    \
                  -tun nat64                   \
                  -int eth0                    \
-                 -pool 192.168.100.0/24
+                 -pool 192.168.100.0/24       \
+                 -u root
+
+####[Script]#####################################################################
+
+13.01.2016      Bash script automating above procedure
+                1. configure variables
+                2. chmod +x command.sh && sudo ./command.sh
